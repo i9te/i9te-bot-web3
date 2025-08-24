@@ -1,14 +1,29 @@
+# db.py
+import os
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, declarative_base
-from config.settings import DATABASE_URL
+from sqlalchemy.orm import sessionmaker
+from contextlib import contextmanager
 
+# Ambil DATABASE_URL dari env
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("❌ DATABASE_URL is not set!")
+
+# Engine
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
 
-def get_db():
-    db = SessionLocal()
+# Session factory
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+# Context manager buat session
+@contextmanager
+def session_scope():
+    session = SessionLocal()
     try:
-        yield db
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
     finally:
-        db.close()
+        session.close()
