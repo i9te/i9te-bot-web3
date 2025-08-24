@@ -1,28 +1,24 @@
-# db.py
-import os
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, declarative_base
 from contextlib import contextmanager
+import os
 
-# Ambil DATABASE_URL dari env
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("❌ DATABASE_URL is not set!")
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///bot.db")  # default SQLite
 
-# Engine
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+engine = create_engine(DATABASE_URL, echo=True)
+SessionLocal = sessionmaker(bind=engine)
 
-# Session factory
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+# ✅ Base harus didefinisikan di sini
+Base = declarative_base()
 
-# Context manager buat session
 @contextmanager
 def session_scope():
+    """Provide a transactional scope around a series of operations."""
     session = SessionLocal()
     try:
         yield session
         session.commit()
-    except Exception:
+    except:
         session.rollback()
         raise
     finally:
