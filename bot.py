@@ -1,54 +1,40 @@
 # ==============================================
-# file: models.py
+# file: bot.py
 # ==============================================
 from __future__ import annotations
-from datetime import datetime, timezone
+import logging
+import os
 from typing import Optional
 
-from sqlalchemy import (
-    Boolean,
-    Column,
-    DateTime,
-    ForeignKey,
-    Integer,
-    String,
-    UniqueConstraint,
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
 )
-from sqlalchemy.orm import declarative_base, relationship
+from sqlalchemy import select
 
-Base = declarative_base()
+from db import session_scope, engine
+from models import Base, User
 
-class User(Base):
-    __tablename__ = "users"
-    id = Column(Integer, primary_key=True)
-    telegram_id = Column(Integer, unique=True, index=True, nullable=False)
-    region = Column(String(32), default=None, index=True)
-    premium = Column(Boolean, default=False, nullable=False)
-    partner_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
-    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+# ---------------- Logging ----------------
+logging.basicConfig(
+    level=os.getenv("LOGLEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+)
+log = logging.getLogger("bot")
 
-    partner = relationship("User", remote_side=[id], uselist=False)
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+if not BOT_TOKEN:
+    raise SystemExit("BOT_TOKEN env var is required")
 
-class Wallet(Base):
-    __tablename__ = "wallets"
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, unique=True)
-    phrase_base = Column(String(64), nullable=True)  # masked base only (not full secret)
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+# Initialize schema
+Base.metadata.create_all(bind=engine)
 
-    user = relationship("User")
-
-    __table_args__ = (
-        UniqueConstraint("user_id", name="uq_wallet_user"),
-    )
-
-# ==============================================
-# file: utils.py
-# ==============================================
-from __future__ import annotations
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-
+# ---------------- Region helpers ----------------
 LANG_REGION_MAP = {
     "id": "Asia", "ms": "Asia", "zh": "Asia", "ja": "Asia",
     "en": "NorthAmerica", "en-US": "NorthAmerica", "en-GB": "Europe",
@@ -70,83 +56,21 @@ def main_menu(premium: bool) -> InlineKeyboardMarkup:
     ]
     if premium:
         rows.append([InlineKeyboardButton("🌍 Set Region", callback_data="setregion")])
-    # placeholder for future mini-app
     rows.append([InlineKeyboardButton("🧩 Mini App", url="https://example.com")])
     return InlineKeyboardMarkup(rows)
 
-# ==============================================
-# file: db.py
-# ==============================================
-from __future__ import annotations
-import os
-from contextlib import contextmanager
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-
-DATABASE_URL = os.getenv("DATABASE_URL", "")
-if not DATABASE_URL:
-    raise SystemExit("DATABASE_URL env var is required")
-
-# Why pool_pre_ping: keep connections healthy on Render
-engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
-
-@contextmanager
-def session_scope():
-    session = SessionLocal()
-    try:
-        yield session
-        session.commit()
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()
-
-# ==============================================
-# file: bot.py
-# ==============================================
-from __future__ import annotations
-import logging
-import os
-from typing import Optional
-
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
-from sqlalchemy import select
-
-from db import session_scope, engine
-from models import Base, User
-from utils import infer_region, main_menu, CONTINENTS
-
-logging.basicConfig(level=os.getenv("LOGLEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-log = logging.getLogger("bot")
-
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-if not BOT_TOKEN:
-    raise SystemExit("BOT_TOKEN env var is required")
-
-# Initialize schema
-Base.metadata.create_all(bind=engine)
-
-# ---------------- Helpers ----------------
-
+# ---------------- DB helper ----------------
 def get_user(telegram_id: int, language_code: Optional[str]) -> User:
     with session_scope() as s:
-        user: Optional[User] = s.execute(select(User).where(User.telegram_id == telegram_id)).scalar_one_or_none()
+        user: Optional[User] = (
+            s.execute(select(User).where(User.telegram_id == telegram_id))
+            .scalar_one_or_none()
+        )
         if user:
             return user
         region = infer_region(language_code)
         user = User(telegram_id=telegram_id, region=region, premium=False)
         s.add(user)
-        # committed by context manager
         return user
 
 # ---------------- Handlers ----------------
@@ -155,7 +79,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     user = get_user(update.effective_user.id, update.effective_user.language_code)
     await update.message.reply_text(
-        f"Welcome {update.effective_user.first_name}!\nRegion: {user.region}\nUse buttons below.",
+        f"Welcome {update.effective_user.first_name}!\n"
+        f"Region: {user.region}\nUse buttons below.",
         reply_markup=main_menu(user.premium),
     )
 
@@ -168,7 +93,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = get_user(tg_id, query.from_user.language_code)
 
     if query.data == "find":
-        # Try to find a partner in same region without partner
         with session_scope() as s:
             me: User = s.merge(user)
             if me.partner_id:
@@ -176,7 +100,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 return
             partner: Optional[User] = (
                 s.query(User)
-                .filter(User.partner_id.is_(None), User.telegram_id != me.telegram_id, User.region == me.region)
+                .filter(User.partner_id.is_(None),
+                        User.telegram_id != me.telegram_id,
+                        User.region == me.region)
                 .order_by(User.updated_at.asc())
                 .first()
             )
@@ -187,7 +113,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 try:
                     await context.bot.send_message(partner.telegram_id, "✅ Partner found! Start chatting.")
                 except Exception:
-                    # If delivery fails, detach partner
                     partner.partner_id = None
                     me.partner_id = None
                     await query.message.reply_text("Partner unreachable. Try again.")
@@ -211,7 +136,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 await query.message.reply_text("❌ Left chat.", reply_markup=main_menu(me.premium))
 
     elif query.data == "next":
-        # Stop current and immediately find again
         with session_scope() as s:
             me: User = s.merge(user)
             partner: Optional[User] = s.query(User).get(me.partner_id) if me.partner_id else None
@@ -223,7 +147,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 except Exception:
                     pass
         await query.message.reply_text("🔎 Searching new partner…")
-        # Reuse find
         query.data = "find"
         await on_button(update, context)
 
@@ -243,7 +166,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     txt = update.message.text
     user = get_user(tg_id, update.effective_user.language_code)
 
-    # Region change flow (premium)
     if context.user_data.get("await_region") and user.premium:
         new_region = (txt or "").strip()
         if new_region not in CONTINENTS:
@@ -256,7 +178,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"✅ Region updated to {new_region}", reply_markup=main_menu(user.premium))
         return
 
-    # Normal chat forwarding
     if user.partner_id:
         with session_scope() as s:
             partner = s.query(User).get(user.partner_id)
@@ -270,10 +191,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         await update.message.reply_text("Use the buttons to find a partner.", reply_markup=main_menu(user.premium))
 
-# --------------- main ---------------
+# ---------------- Main ----------------
 def main() -> None:
-    token = BOT_TOKEN
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
@@ -281,95 +201,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-# ==============================================
-# file: web.py
-# ==============================================
-from __future__ import annotations
-import os
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
-from sqlalchemy import select
-
-from db import session_scope, engine
-from models import Base, User, Wallet
-
-app = FastAPI(title="AnonBot Web API")
-Base.metadata.create_all(bind=engine)
-
-class WalletInitIn(BaseModel):
-    telegram_id: int
-    action: str = Field(pattern="^(generate|import)$")
-    phrase: str | None = None
-
-class WalletOut(BaseModel):
-    user_id: int
-    phrase_base: str | None
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-@app.post("/wallet/init", response_model=WalletOut)
-def wallet_init(body: WalletInitIn):
-    # Note: demo only; do not store real seed securely here.
-    with session_scope() as s:
-        user = s.execute(select(User).where(User.telegram_id == body.telegram_id)).scalar_one_or_none()
-        if not user:
-            user = User(telegram_id=body.telegram_id)
-            s.add(user)
-            s.flush()
-        wallet = s.execute(select(Wallet).where(Wallet.user_id == user.id)).scalar_one_or_none()
-        if not wallet:
-            wallet = Wallet(user_id=user.id)
-            s.add(wallet)
-        if body.action == "generate":
-            # Keep only masked base (first 8 chars of a fake phrase)
-            import secrets
-            fake = secrets.token_hex(16)
-            wallet.phrase_base = fake[:8]
-        elif body.action == "import":
-            if not body.phrase:
-                raise HTTPException(400, "phrase required for import")
-            wallet.phrase_base = body.phrase.strip()[:8]
-        return WalletOut(user_id=user.id, phrase_base=wallet.phrase_base)
-
-# To run on Render Web Service, set Start Command:
-# uvicorn web:app --host 0.0.0.0 --port 10000
-
-# ==============================================
-# file: requirements.txt
-# ==============================================
-python-telegram-bot==20.6
-SQLAlchemy==2.0.23
-psycopg2-binary==2.9.9
-fastapi==0.115.2
-uvicorn[standard]==0.30.6
-
-# ==============================================
-# file: Procfile
-# ==============================================
-worker: python bot.py
-web: uvicorn web:app --host 0.0.0.0 --port 10000
-
-# ==============================================
-# file: README.md
-# ==============================================
-# Telegram Anonymous Chat (Hybrid)
-
-- Worker: Telegram bot (polling) with inline buttons and DB pairing.
-- Web: FastAPI for future Mini DApps (wallet stub included).
-
-## Env Vars
-- `BOT_TOKEN`: Telegram BotFather token
-- `DATABASE_URL`: Postgres URL (Render Internal URL recommended)
-
-## Deploy (Render)
-1. Create **Postgres** → copy Internal Database URL → set as `DATABASE_URL`.
-2. Create **Background Worker** (repo) → Start Command uses `Procfile` entry `worker`.
-3. Create **Web Service** (repo) → Start Command uses `Procfile` entry `web`.
-
-## Notes
-- Region is auto-set from `language_code` at first start.
-- `/setregion` available for premium users only (button shown if `premium=True`).
-- Free tier supports text-only; media/AI can be added later via new handlers.
