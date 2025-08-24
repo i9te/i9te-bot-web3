@@ -1,5 +1,5 @@
 # ==============================================
-# file: bot.py
+# file: bot.py (revised)
 # ==============================================
 from __future__ import annotations
 import logging
@@ -43,21 +43,21 @@ LANG_REGION_MAP = {
 }
 CONTINENTS = ["Africa", "Asia", "Europe", "NorthAmerica", "SouthAmerica", "Oceania"]
 
-def infer_region(language_code: str | None) -> str:
+def infer_region(language_code: Optional[str]) -> str:
     if not language_code:
         return "Europe"
     return LANG_REGION_MAP.get(language_code, LANG_REGION_MAP.get(language_code.split("-")[0], "Europe"))
 
 def main_menu(premium: bool) -> InlineKeyboardMarkup:
-    rows = [
+    buttons = [
         [InlineKeyboardButton("🟢 Find Partner", callback_data="find")],
         [InlineKeyboardButton("🔄 Next Partner", callback_data="next")],
         [InlineKeyboardButton("🔴 Stop Chat", callback_data="stop")],
     ]
     if premium:
-        rows.append([InlineKeyboardButton("🌍 Set Region", callback_data="setregion")])
-    rows.append([InlineKeyboardButton("🧩 Mini App", url="https://example.com")])
-    return InlineKeyboardMarkup(rows)
+        buttons.append([InlineKeyboardButton("🌍 Set Region", callback_data="setregion")])
+    buttons.append([InlineKeyboardButton("🧩 Mini App", url="https://example.com")])
+    return InlineKeyboardMarkup(buttons)
 
 # ---------------- DB helper ----------------
 def get_user(telegram_id: int, language_code: Optional[str]) -> User:
@@ -71,7 +71,66 @@ def get_user(telegram_id: int, language_code: Optional[str]) -> User:
         region = infer_region(language_code)
         user = User(telegram_id=telegram_id, region=region, premium=False)
         s.add(user)
+        log.info(f"New user created: {telegram_id}, region={region}")
         return user
+
+# ---------------- Partner Handling ----------------
+def find_partner(user: User, context: ContextTypes.DEFAULT_TYPE, query) -> None:
+    with session_scope() as s:
+        me: User = s.merge(user)
+        if me.partner_id:
+            context.bot.loop.create_task(query.message.reply_text("You are already connected."))
+            return
+        partner: Optional[User] = (
+            s.query(User)
+            .filter(User.partner_id.is_(None), User.telegram_id != me.telegram_id, User.region == me.region)
+            .order_by(User.updated_at.asc())
+            .first()
+        )
+        if partner:
+            me.partner_id = partner.id
+            partner.partner_id = me.id
+            context.bot.loop.create_task(query.message.reply_text("✅ Partner found! Start chatting."))
+            try:
+                context.bot.loop.create_task(context.bot.send_message(partner.telegram_id, "✅ Partner found! Start chatting."))
+            except Exception:
+                partner.partner_id = None
+                me.partner_id = None
+                context.bot.loop.create_task(query.message.reply_text("Partner unreachable. Try again."))
+        else:
+            context.bot.loop.create_task(query.message.reply_text("⏳ Waiting for a partner in your region…"))
+
+def stop_chat(user: User, context: ContextTypes.DEFAULT_TYPE, query) -> None:
+    with session_scope() as s:
+        me: User = s.merge(user)
+        if not me.partner_id:
+            context.bot.loop.create_task(query.message.reply_text("You are not in a chat."))
+            return
+        partner: Optional[User] = s.query(User).get(me.partner_id)
+        me.partner_id = None
+        if partner and partner.partner_id == me.id:
+            partner.partner_id = None
+            try:
+                context.bot.loop.create_task(context.bot.send_message(partner.telegram_id, "❌ Your partner left."))
+            except Exception:
+                pass
+        context.bot.loop.create_task(query.message.reply_text("❌ Left chat.", reply_markup=main_menu(me.premium)))
+
+def next_partner(user: User, context: ContextTypes.DEFAULT_TYPE, query) -> None:
+    with session_scope() as s:
+        me: User = s.merge(user)
+        partner: Optional[User] = s.query(User).get(me.partner_id) if me.partner_id else None
+        me.partner_id = None
+        if partner and partner.partner_id == me.id:
+            partner.partner_id = None
+            try:
+                context.bot.loop.create_task(context.bot.send_message(partner.telegram_id, "🔄 Your partner skipped you."))
+            except Exception:
+                pass
+    context.bot.loop.create_task(query.message.reply_text("🔎 Searching new partner…"))
+    # trigger find again
+    query.data = "find"
+    context.bot.loop.create_task(on_button(query._update, context))
 
 # ---------------- Handlers ----------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -79,8 +138,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     user = get_user(update.effective_user.id, update.effective_user.language_code)
     await update.message.reply_text(
-        f"Welcome {update.effective_user.first_name}!\n"
-        f"Region: {user.region}\nUse buttons below.",
+        f"Welcome {update.effective_user.first_name}!\nRegion: {user.region}\nUse buttons below.",
         reply_markup=main_menu(user.premium),
     )
 
@@ -93,63 +151,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = get_user(tg_id, query.from_user.language_code)
 
     if query.data == "find":
-        with session_scope() as s:
-            me: User = s.merge(user)
-            if me.partner_id:
-                await query.message.reply_text("You are already connected.")
-                return
-            partner: Optional[User] = (
-                s.query(User)
-                .filter(User.partner_id.is_(None),
-                        User.telegram_id != me.telegram_id,
-                        User.region == me.region)
-                .order_by(User.updated_at.asc())
-                .first()
-            )
-            if partner:
-                me.partner_id = partner.id
-                partner.partner_id = me.id
-                await query.message.reply_text("✅ Partner found! Start chatting.")
-                try:
-                    await context.bot.send_message(partner.telegram_id, "✅ Partner found! Start chatting.")
-                except Exception:
-                    partner.partner_id = None
-                    me.partner_id = None
-                    await query.message.reply_text("Partner unreachable. Try again.")
-            else:
-                await query.message.reply_text("⏳ Waiting for a partner in your region…")
-
+        find_partner(user, context, query)
     elif query.data == "stop":
-        with session_scope() as s:
-            me: User = s.merge(user)
-            if not me.partner_id:
-                await query.message.reply_text("You are not in a chat.")
-            else:
-                partner: Optional[User] = s.query(User).get(me.partner_id)
-                me.partner_id = None
-                if partner and partner.partner_id == me.id:
-                    partner.partner_id = None
-                    try:
-                        await context.bot.send_message(partner.telegram_id, "❌ Your partner left.")
-                    except Exception:
-                        pass
-                await query.message.reply_text("❌ Left chat.", reply_markup=main_menu(me.premium))
-
+        stop_chat(user, context, query)
     elif query.data == "next":
-        with session_scope() as s:
-            me: User = s.merge(user)
-            partner: Optional[User] = s.query(User).get(me.partner_id) if me.partner_id else None
-            me.partner_id = None
-            if partner and partner.partner_id == me.id:
-                partner.partner_id = None
-                try:
-                    await context.bot.send_message(partner.telegram_id, "🔄 Your partner skipped you.")
-                except Exception:
-                    pass
-        await query.message.reply_text("🔎 Searching new partner…")
-        query.data = "find"
-        await on_button(update, context)
-
+        next_partner(user, context, query)
     elif query.data == "setregion":
         if not user.premium:
             await query.message.reply_text("⚠️ Premium only.")
@@ -166,6 +172,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     txt = update.message.text
     user = get_user(tg_id, update.effective_user.language_code)
 
+    # region set flow
     if context.user_data.get("await_region") and user.premium:
         new_region = (txt or "").strip()
         if new_region not in CONTINENTS:
@@ -178,6 +185,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"✅ Region updated to {new_region}", reply_markup=main_menu(user.premium))
         return
 
+    # normal chat
     if user.partner_id:
         with session_scope() as s:
             partner = s.query(User).get(user.partner_id)
@@ -197,6 +205,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    log.info("Bot started.")
     app.run_polling()
 
 if __name__ == "__main__":
